@@ -58,15 +58,23 @@ fn receipt_connect_url_foreign_pair_rejected() {
         crate::managed_agents::ManagedAgentRuntimeKey::new("aa".repeat(32), "ws://localhost:3100")
             .unwrap(),
     );
-    receipt.connect_relay_url = Some("ws://localhost:4000".into());
     let path = std::path::PathBuf::from(format!("{}.json", receipt.key.runtime_id()));
-    assert!(!super::valid_agent_runtime_receipt_with(
-        &path,
-        &receipt,
-        "test-instance",
-        |_| true,
-        |_, _| true,
-    ));
+    for target in [
+        "ws://localhost:4000",
+        "not a url",
+        "https://localhost:3100",
+        "ws://user@localhost:3100",
+        "ws://localhost:3100/#fragment",
+    ] {
+        receipt.connect_relay_url = Some(target.into());
+        assert!(!super::valid_agent_runtime_receipt_with(
+            &path,
+            &receipt,
+            "test-instance",
+            |_| true,
+            |_, _| true,
+        ));
+    }
 }
 
 #[test]

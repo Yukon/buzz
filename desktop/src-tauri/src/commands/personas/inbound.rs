@@ -22,6 +22,9 @@ mod inbound_tests;
 #[cfg(all(test, not(target_os = "windows")))]
 mod catalog_reconcile_tests;
 
+#[cfg(all(test, unix))]
+mod relay_target_tests;
+
 #[derive(Debug)]
 enum InboundRuntimeRefresh {
     Local {
