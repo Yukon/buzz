@@ -64,9 +64,24 @@ pub enum DbError {
     #[error("deletion safety error: {0}")]
     DeletionSafety(String),
 
+    /// A complete read-state snapshot exceeds its bounded resource budget.
+    #[error("read-state snapshot exceeds event or byte limit")]
+    ReadStateSnapshotTooLarge,
+
+    /// A complete thread window exceeds its request-wide work allowance.
+    #[error("thread window exceeds {0} budget")]
+    ThreadWindowBudgetExceeded(&'static str),
+
     /// A stored timestamp value could not be interpreted.
     #[error("invalid timestamp: {0}")]
     InvalidTimestamp(i64),
+
+    /// A roster mutation would remove the last effective relay Operator,
+    /// leaving no one able to administer the deployment through the API.
+    /// The transaction is rolled back and the caller must add a replacement
+    /// Operator before demoting or deleting the current one.
+    #[error("operation would remove the last relay operator")]
+    LastOperator,
 }
 
 /// Convenience alias for `Result<T, DbError>`.

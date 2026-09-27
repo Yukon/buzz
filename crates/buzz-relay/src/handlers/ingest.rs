@@ -50,6 +50,98 @@ use crate::conformance::{
     state_for_request, EmitGuard, TraceAction, Verdict,
 };
 
+fn huddle_backing_channel_id(event: &Event) -> Result<Uuid, IngestError> {
+    let content: serde_json::Value = serde_json::from_str(&event.content).map_err(|_| {
+        IngestError::Rejected("invalid: Huddle event content must be a JSON object".into())
+    })?;
+    let channel_id = content
+        .get("ephemeral_channel_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            IngestError::Rejected("invalid: Huddle event must name an ephemeral_channel_id".into())
+        })?;
+    channel_id.parse::<Uuid>().map_err(|_| {
+        IngestError::Rejected("invalid: Huddle ephemeral_channel_id must be a UUID".into())
+    })
+}
+
+fn map_huddle_backing_channel_error(error: buzz_db::DbError) -> IngestError {
+    match error {
+        buzz_db::DbError::ChannelNotFound(_) => {
+            IngestError::Rejected("invalid: Huddle backing channel not found".into())
+        }
+        error => IngestError::Internal(format!("error: loading Huddle backing channel: {error}")),
+    }
+}
+
+fn expected_huddle_backing_ttl(ephemeral_ttl_override: Option<i32>) -> i32 {
+    ephemeral_ttl_override.unwrap_or(3600)
+}
+
+async fn validate_huddle_lifecycle_event(
+    tenant: &TenantContext,
+    state: &AppState,
+    event: &Event,
+    kind: u32,
+) -> Result<(), IngestError> {
+    if kind != KIND_HUDDLE_STARTED && kind != KIND_HUDDLE_ENDED {
+        return Ok(());
+    }
+
+    let backing_channel_id = huddle_backing_channel_id(event)?;
+    let backing = state
+        .db
+        .get_channel_for_event_write(tenant.community(), backing_channel_id)
+        .await
+        .map_err(map_huddle_backing_channel_error)?;
+    let signer = event.pubkey.to_bytes();
+    let relay = state.relay_keypair.public_key().to_bytes();
+    let signer_created_backing = backing.created_by.as_slice() == signer.as_slice();
+
+    if kind == KIND_HUDDLE_STARTED {
+        let expected_ttl = expected_huddle_backing_ttl(state.config.ephemeral_ttl_override);
+        if !signer_created_backing
+            || backing.channel_type != "stream"
+            || backing.visibility != "private"
+            || backing.ttl_seconds != Some(expected_ttl)
+            || backing.archived_at.is_some()
+        {
+            return Err(IngestError::Rejected(
+                "invalid: Huddle start must reference the signer's active private ephemeral stream"
+                    .into(),
+            ));
+        }
+    } else {
+        if !signer_created_backing && signer.as_slice() != relay.as_slice() {
+            return Err(IngestError::Rejected(
+                "invalid: only the Huddle creator or relay may end it".into(),
+            ));
+        }
+        let parent_channel_id = extract_channel_id(event).ok_or_else(|| {
+            IngestError::Rejected("invalid: Huddle end must name its parent channel".into())
+        })?;
+        let linked = state
+            .db
+            .huddle_started_link_exists_for_event_write(
+                tenant.community(),
+                parent_channel_id,
+                backing_channel_id,
+                &backing.created_by,
+            )
+            .await
+            .map_err(|error| {
+                IngestError::Internal(format!("error: checking Huddle start linkage: {error}"))
+            })?;
+        if !linked {
+            return Err(IngestError::Rejected(
+                "invalid: Huddle end does not match a creator-signed start in this channel".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_custom_emoji_tags(event: &Event) -> Result<(), IngestError> {
     for tag in event.tags.iter() {
         let parts = tag.as_slice();
@@ -97,6 +189,60 @@ fn validate_reaction_emoji(event: &Event, emoji: &str) -> Result<(), IngestError
         )));
     }
     Ok(())
+}
+
+/// A validated canvas `expected-revision` precondition.
+///
+/// The tag value is either the literal `none` (expect no canvas head yet) or a
+/// 64-hex event ID (expect the live head to match it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanvasRevisionSpec {
+    /// Literal `none` — the writer expects no canvas head to exist.
+    NoHead,
+    /// A 32-byte event ID the live canvas head must equal.
+    Head(Vec<u8>),
+}
+
+/// Parse the optional canvas `expected-revision` precondition from an event.
+///
+/// Returns `Ok(None)` when the tag is absent (backward-compatible unconditional
+/// append). The tag shape is exactly `["expected-revision", value]`: a
+/// one-element `["expected-revision"]` or any three-or-more-element form is
+/// malformed and rejects `invalid:` — it is never treated as absent. At most
+/// one `expected-revision` tag may be present. A single well-formed tag yields
+/// `Some(spec)`.
+pub(crate) fn parse_canvas_expected_revision(
+    event: &Event,
+) -> Result<Option<CanvasRevisionSpec>, IngestError> {
+    let mut tags = event
+        .tags
+        .iter()
+        .map(nostr::Tag::as_slice)
+        .filter(|parts| parts.first().map(String::as_str) == Some("expected-revision"));
+
+    let Some(tag) = tags.next() else {
+        return Ok(None);
+    };
+    if tags.next().is_some() {
+        return Err(IngestError::Rejected(
+            "invalid: duplicate expected-revision tag".into(),
+        ));
+    }
+    if tag.len() != 2 {
+        return Err(IngestError::Rejected(
+            "invalid: expected-revision tag must have exactly one value".into(),
+        ));
+    }
+    let value = tag[1].as_str();
+
+    if value == "none" {
+        return Ok(Some(CanvasRevisionSpec::NoHead));
+    }
+    let bytes = hex::decode(value)
+        .ok()
+        .filter(|bytes| bytes.len() == 32)
+        .ok_or_else(|| IngestError::Rejected("invalid: bad expected canvas revision".into()))?;
+    Ok(Some(CanvasRevisionSpec::Head(bytes)))
 }
 
 /// How the HTTP caller authenticated (for [`IngestAuth::Http`]).
@@ -293,6 +439,14 @@ pub struct IngestResult {
 pub enum IngestError {
     /// Client error (bad event) — WS: OK false, HTTP: 400.
     Rejected(String),
+    /// Canvas CAS precondition failure — WS: OK false, HTTP: 409.
+    ///
+    /// Emitted when a canvas write's `expected-revision` tag no longer matches
+    /// the relay's canonical head: the revision is missing, has changed, or the
+    /// new event does not supersede the current one.  Kept separate from
+    /// [`IngestError::Rejected`] so the HTTP bridge can map it to
+    /// `409 CONFLICT` while generic client mistakes remain `400 BAD_REQUEST`.
+    CanvasConflict(String),
     /// Auth/scope error — WS: OK false, HTTP: 401/403.
     AuthFailed(String),
     /// Server error — WS: OK false, HTTP: 500.
@@ -505,7 +659,10 @@ pub(crate) async fn derive_reaction_channel(
         _ => return ReactionChannelResult::NoTarget,
     };
 
-    match db.get_event_by_id(community_id, &id_bytes).await {
+    match db
+        .get_event_by_id_for_event_write(community_id, &id_bytes)
+        .await
+    {
         Ok(Some(target)) => match target.channel_id {
             Some(ch_id) => ReactionChannelResult::Channel(ch_id),
             None => ReactionChannelResult::NoChannel,
@@ -667,7 +824,7 @@ pub(crate) async fn check_channel_membership(
         Some(ch) => ch.visibility == "open",
         None => state
             .db
-            .get_channel(tenant.community(), ch_id)
+            .get_channel_for_event_write(tenant.community(), ch_id)
             .await
             .map(|ch| ch.visibility == "open")
             .unwrap_or(false),
@@ -724,39 +881,20 @@ pub(crate) async fn resolve_nip10_thread_meta(
     channel_id: Uuid,
     state: &AppState,
 ) -> Result<Option<ThreadMetadataOwned>, String> {
-    let mut root_hex: Option<String> = None;
-    let mut reply_hex: Option<String> = None;
+    let markers = buzz_core::nip10::parse_thread_markers(&event.tags);
 
-    for tag in event.tags.iter() {
-        let parts = tag.as_slice();
-        if parts.len() >= 4 && parts[0] == "e" {
-            let hex_val = &parts[1];
-            let marker = &parts[3];
-            if hex_val.len() == 64 && hex_val.chars().all(|c| c.is_ascii_hexdigit()) {
-                match marker.as_str() {
-                    "root" => root_hex = Some(hex_val.to_string()),
-                    "reply" => reply_hex = Some(hex_val.to_string()),
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    if root_hex.is_none() && reply_hex.is_none() {
-        return Ok(None);
-    }
-
-    let (root_hex, parent_hex) = match (root_hex, reply_hex) {
-        (Some(r), Some(p)) => (r, p),
-        (None, Some(p)) => (p.clone(), p),
-        (Some(_), None) | (None, None) => return Ok(None),
+    let (root_hex, parent_hex) = match markers.resolve() {
+        Some(pair) => pair,
+        None => return Ok(None),
     };
 
     let parent_bytes =
         hex::decode(&parent_hex).map_err(|_| "invalid parent event ID hex".to_string())?;
 
     let (parent_event_result, parent_meta_result) = tokio::join!(
-        state.db.get_event_by_id(community_id, &parent_bytes),
+        state
+            .db
+            .get_event_by_id_for_event_write(community_id, &parent_bytes),
         state
             .db
             .get_thread_metadata_by_event(community_id, &parent_bytes),
@@ -792,7 +930,7 @@ pub(crate) async fn resolve_nip10_thread_meta(
             }
             let root_ts = if let Ok(Some(root_ev)) = state
                 .db
-                .get_event_by_id(community_id, &effective_root)
+                .get_event_by_id_for_event_write(community_id, &effective_root)
                 .await
             {
                 chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
@@ -807,46 +945,18 @@ pub(crate) async fn resolve_nip10_thread_meta(
             (effective_root, root_ts, depth)
         }
         None => {
-            let parent_root = parent_event
-                .event
-                .tags
-                .iter()
-                .find_map(|t| {
-                    let parts = t.as_slice();
-                    if parts.len() >= 4 && parts[0] == "e" && parts[3] == "root" {
-                        hex::decode(&parts[1]).ok().filter(|b| b.len() == 32)
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    parent_event.event.tags.iter().find_map(|t| {
-                        let parts = t.as_slice();
-                        if parts.len() >= 4 && parts[0] == "e" && parts[3] == "reply" {
-                            hex::decode(&parts[1]).ok().filter(|b| b.len() == 32)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_else(|| parent_bytes.clone());
+            let (parent_root, root_created, depth) = derive_ancestry_from_parent_tags(
+                community_id,
+                &parent_event.event,
+                &parent_bytes,
+                parent_created,
+                state,
+            )
+            .await;
 
             if client_root_bytes != parent_root {
                 return Err("root tag does not match thread ancestry".to_string());
             }
-            let depth = if parent_root == parent_bytes { 1 } else { 2 };
-            let root_created = if parent_root != parent_bytes {
-                if let Ok(Some(root_ev)) =
-                    state.db.get_event_by_id(community_id, &parent_root).await
-                {
-                    chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
-                        .unwrap_or(parent_created)
-                } else {
-                    parent_created
-                }
-            } else {
-                parent_created
-            };
             (parent_root, root_created, depth)
         }
     };
@@ -870,6 +980,187 @@ pub(crate) async fn resolve_nip10_thread_meta(
         depth,
         broadcast,
     }))
+}
+
+/// Recover a reply's thread ancestry from its *parent's* NIP-10 tags when the
+/// parent has **no** `thread_metadata` row (legacy or not-yet-indexed events).
+///
+/// The parent's markers are first collapsed through `ThreadMarkers::resolve()`:
+/// a `root`+`reply` parent carries its marked root, a `reply`-only parent carries
+/// its reply target as root, and a root-only/malformed/unmarked parent is itself
+/// top-level and its own root. Depth is 1 when the parent is the root and 2
+/// otherwise — a reply to a nested-but-unindexed parent must not be mistaken for
+/// a top-level reply.
+///
+/// Shared by [`resolve_nip10_thread_meta`] (client path) and
+/// [`resolve_relay_reply_thread_meta`] (workflow path) so the two cannot
+/// diverge. Returns `(root_event_id, root_event_created_at, depth)`.
+async fn derive_ancestry_from_parent_tags(
+    community_id: CommunityId,
+    parent_event: &Event,
+    parent_bytes: &[u8],
+    parent_created: chrono::DateTime<Utc>,
+    state: &AppState,
+) -> (Vec<u8>, chrono::DateTime<Utc>, i32) {
+    let marked_ancestor = |id_hex: &str| hex::decode(id_hex).ok().filter(|b| b.len() == 32);
+    let markers = buzz_core::nip10::parse_thread_markers(&parent_event.tags);
+    let parent_root = markers
+        .resolve()
+        .map(|(root, _)| root)
+        .as_deref()
+        .and_then(marked_ancestor)
+        .unwrap_or_else(|| parent_bytes.to_vec());
+
+    if parent_root.as_slice() == parent_bytes {
+        (parent_root, parent_created, 1)
+    } else {
+        let root_created = if let Ok(Some(root_ev)) = state
+            .db
+            .get_event_by_id_for_event_write(community_id, &parent_root)
+            .await
+        {
+            chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
+                .unwrap_or(parent_created)
+        } else {
+            parent_created
+        };
+        (parent_root, root_created, 2)
+    }
+}
+
+/// Resolved thread ancestry for a relay-built reply (workflow path).
+///
+/// Carries the parent and root identifiers plus the reply's depth, so the
+/// caller can both emit matching NIP-10 `root`/`reply` tags and persist thread
+/// metadata for the signed reply event.
+pub(crate) struct ReplyAncestry {
+    pub parent_event_id: Vec<u8>,
+    pub parent_event_created_at: chrono::DateTime<Utc>,
+    pub root_event_id: Vec<u8>,
+    pub root_event_created_at: chrono::DateTime<Utc>,
+    pub depth: i32,
+}
+
+impl ReplyAncestry {
+    /// Root event ID as lowercase hex, for the NIP-10 `root` tag.
+    pub fn root_hex(&self) -> String {
+        hex::encode(&self.root_event_id)
+    }
+
+    /// Parent event ID as lowercase hex, for the NIP-10 `reply` tag.
+    pub fn parent_hex(&self) -> String {
+        hex::encode(&self.parent_event_id)
+    }
+
+    /// Build the DB thread-metadata params for the signed reply event.
+    pub fn into_thread_meta(
+        self,
+        reply_event_id: Vec<u8>,
+        reply_created_at: chrono::DateTime<Utc>,
+        channel_id: Uuid,
+    ) -> ThreadMetadataOwned {
+        ThreadMetadataOwned {
+            event_id: reply_event_id,
+            event_created_at: reply_created_at,
+            channel_id,
+            parent_event_id: self.parent_event_id,
+            parent_event_created_at: self.parent_event_created_at,
+            root_event_id: self.root_event_id,
+            root_event_created_at: self.root_event_created_at,
+            depth: self.depth,
+            broadcast: false,
+        }
+    }
+}
+
+/// Resolve thread ancestry for a reply built by the relay (workflow path).
+///
+/// Unlike [`resolve_nip10_thread_meta`], which validates client-supplied NIP-10
+/// `e` tags, this derives ancestry from a known `parent_hex` (the triggering
+/// event) and *computes* the correct root and depth. Enforces the same-channel
+/// invariant and the depth limit that the ingest path applies.
+pub(crate) async fn resolve_relay_reply_thread_meta(
+    community_id: CommunityId,
+    parent_hex: &str,
+    channel_id: Uuid,
+    state: &AppState,
+) -> Result<ReplyAncestry, String> {
+    let parent_bytes =
+        hex::decode(parent_hex).map_err(|_| "invalid parent event ID hex".to_string())?;
+
+    let (parent_event_result, parent_meta_result) = tokio::join!(
+        state
+            .db
+            .get_event_by_id_for_event_write(community_id, &parent_bytes),
+        state
+            .db
+            .get_thread_metadata_by_event(community_id, &parent_bytes),
+    );
+
+    let parent_event = parent_event_result
+        .map_err(|e| format!("db error looking up parent: {e}"))?
+        .ok_or_else(|| "reply parent not found".to_string())?;
+
+    match parent_event.channel_id {
+        Some(parent_ch) if parent_ch != channel_id => {
+            return Err("parent event belongs to a different channel".to_string());
+        }
+        None => return Err("parent event has no channel association".to_string()),
+        _ => {}
+    }
+
+    let parent_created =
+        chrono::DateTime::from_timestamp(parent_event.event.created_at.as_secs() as i64, 0)
+            .unwrap_or_else(Utc::now);
+
+    let parent_meta =
+        parent_meta_result.map_err(|e| format!("db error looking up thread metadata: {e}"))?;
+
+    // Root = parent's root if the parent is itself a reply, else the parent.
+    // Depth = parent depth + 1 (a direct reply to a top-level message is depth 1).
+    let (root_bytes, root_created, depth) = match parent_meta {
+        Some(meta) => {
+            let effective_root = meta.root_event_id.unwrap_or_else(|| parent_bytes.clone());
+            let root_ts = if effective_root == parent_bytes {
+                parent_created
+            } else if let Ok(Some(root_ev)) = state
+                .db
+                .get_event_by_id_for_event_write(community_id, &effective_root)
+                .await
+            {
+                chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
+                    .unwrap_or(parent_created)
+            } else {
+                parent_created
+            };
+            (effective_root, root_ts, meta.depth + 1)
+        }
+        // No metadata row ⇒ recover the parent's ancestry from its own NIP-10
+        // tags. A marked (but not-yet-indexed) nested parent yields depth 2, not
+        // a false top-level depth 1.
+        None => {
+            derive_ancestry_from_parent_tags(
+                community_id,
+                &parent_event.event,
+                &parent_bytes,
+                parent_created,
+                state,
+            )
+            .await
+        }
+    };
+
+    if depth > 100 {
+        return Err("thread depth limit exceeded".to_string());
+    }
+
+    Ok(ReplyAncestry {
+        parent_event_id: parent_bytes,
+        parent_event_created_at: parent_created,
+        root_event_id: root_bytes,
+        root_event_created_at: root_created,
+        depth,
+    })
 }
 
 /// Count all `e` tags regardless of content validity.
@@ -944,7 +1235,7 @@ async fn validate_edit_ownership(
         hex::decode(&target_hex).map_err(|_| "invalid target event ID".to_string())?;
     let target_event = state
         .db
-        .get_event_by_id(community_id, &target_bytes)
+        .get_event_by_id_for_event_write(community_id, &target_bytes)
         .await
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "edit target event not found".to_string())?;
@@ -974,7 +1265,7 @@ async fn validate_edit_ownership(
             if !is_member {
                 let is_open = state
                     .db
-                    .get_channel(community_id, ch_id)
+                    .get_channel_for_event_write(community_id, ch_id)
                     .await
                     .map(|ch| ch.visibility == "open")
                     .unwrap_or(false);
@@ -1025,7 +1316,7 @@ async fn validate_forum_vote_target(
         hex::decode(&target_hex).map_err(|_| "invalid target event ID".to_string())?;
     let target_event = state
         .db
-        .get_event_by_id(community_id, &target_bytes)
+        .get_event_by_id_for_event_write(community_id, &target_bytes)
         .await
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "vote target event not found".to_string())?;
@@ -1938,6 +2229,26 @@ pub async fn ingest_event(
     result
 }
 
+/// Maximum seconds in the future a kind:40100 canvas event may be timestamped.
+/// Tighter than the general ±900 s drift window to prevent a ceiling-timestamped
+/// head from producing a write at `head + 1` that the relay would accept (the
+/// boundary head itself is within ±900 s) but that permanently stalls all later
+/// legitimate writes behind an inflated floor. Invariant:
+///   client ceiling (60 s, CANVAS_MAX_FUTURE_SKEW_SECS) < canvas relay bound (300 s) < relay general bound (900 s)
+const CANVAS_MAX_INGEST_FUTURE_SECS: i64 = 300;
+
+/// Returns `Ok(())` if the canvas event timestamp is within the allowed future
+/// window, or `Err` with a rejection message otherwise.
+///
+/// Extracted as a pure function so the boundary can be regression-tested without
+/// a live database or HTTP stack.
+fn validate_canvas_future_timestamp(event_ts: i64, now: i64) -> Result<(), &'static str> {
+    if event_ts - now > CANVAS_MAX_INGEST_FUTURE_SECS {
+        return Err("invalid: canvas event timestamp too far in the future");
+    }
+    Ok(())
+}
+
 async fn ingest_event_inner(
     state: &Arc<AppState>,
     tracer: &Arc<dyn buzz_conformance::Tracer>,
@@ -2009,6 +2320,14 @@ async fn ingest_event_inner(
         return Err(IngestError::Rejected(
             "invalid: event timestamp too far from server time".into(),
         ));
+    }
+
+    // kind:40100 canvas events carry a tighter future ceiling — see
+    // `validate_canvas_future_timestamp` for the rationale and invariant.
+    if kind_u32 == KIND_CANVAS {
+        if let Err(msg) = validate_canvas_future_timestamp(event_ts, now) {
+            return Err(IngestError::Rejected(msg.into()));
+        }
     }
 
     const MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024; // 256 KB
@@ -2216,7 +2535,7 @@ async fn ingest_event_inner(
                 })?;
                 match state
                     .db
-                    .get_event_by_id(tenant.community(), &target_bytes)
+                    .get_event_by_id_for_event_write(tenant.community(), &target_bytes)
                     .await
                 {
                     Ok(Some(target)) => target.channel_id,
@@ -2264,7 +2583,11 @@ async fn ingest_event_inner(
     // it later in this request); each gate keeps its existing missing-row
     // behavior.
     let channel_row = match channel_id {
-        Some(ch_id) => state.db.get_channel(tenant.community(), ch_id).await.ok(),
+        Some(ch_id) => state
+            .db
+            .get_channel_for_event_write(tenant.community(), ch_id)
+            .await
+            .ok(),
         None => None,
     };
     // E1 phase-2 (§4.8 phase-2 addendum): resolve the fan-out visibility once,
@@ -2432,6 +2755,8 @@ async fn ingest_event_inner(
             message: "info: you have left this relay".into(),
         });
     }
+
+    validate_huddle_lifecycle_event(tenant, state, &event, kind_u32).await?;
 
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
         crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
@@ -2909,7 +3234,24 @@ async fn ingest_event_inner(
         });
     }
 
-    let (stored_event, was_inserted) = if buzz_core::kind::is_replaceable(kind_u32) {
+    // Parse a canvas `expected-revision` precondition once, ahead of the write
+    // dispatch. Malformed or duplicate tags reject here (never reaching the DB);
+    // an absent tag yields `None`, routing canvas writes to the generic append.
+    let canvas_revision_spec = if kind_u32 == KIND_CANVAS {
+        parse_canvas_expected_revision(&event)?
+    } else {
+        None
+    };
+
+    let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
+    let (stored_event, was_inserted) = if workflow_deletion {
+        // A single commit owns public acceptance, domain mutation, and dispatch.
+        // Failure rolls everything back; identical concurrent requests cannot
+        // divide insertion and repair ownership between two relay workers.
+        crate::handlers::side_effects::persist_workflow_deletion(tenant, &event, state)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?
+    } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
         state
@@ -2932,6 +3274,42 @@ async fn ingest_event_inner(
             .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
             .await
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+    } else if let Some(spec) = canvas_revision_spec.as_ref() {
+        // Canvas write carrying an optimistic-concurrency precondition. Plain
+        // canvas writes (no `expected-revision` tag) fall through to the generic
+        // append path below, preserving unconditional behavior. The channel is
+        // guaranteed present here: KIND_CANVAS requires an `h` tag and step 5b
+        // resolved it into `channel_id`.
+        let channel = channel_id
+            .ok_or_else(|| IngestError::Rejected("invalid: canvas event missing channel".into()))?;
+        let precondition = match spec {
+            CanvasRevisionSpec::NoHead => buzz_db::ChannelHeadPrecondition::ExpectNoHead,
+            CanvasRevisionSpec::Head(id) => buzz_db::ChannelHeadPrecondition::ExpectedHead(id),
+        };
+        let (stored_event, status) = state
+            .db
+            .insert_channel_head_checked(tenant.community(), &event, channel, precondition)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+        match status {
+            buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
+                return Err(IngestError::CanvasConflict(
+                    "conflict: canvas revision does not exist".into(),
+                ));
+            }
+            buzz_db::ChannelHeadWriteStatus::RevisionMismatch => {
+                return Err(IngestError::CanvasConflict(
+                    "conflict: canvas changed since it was loaded".into(),
+                ));
+            }
+            buzz_db::ChannelHeadWriteStatus::SupersedeFailed => {
+                return Err(IngestError::CanvasConflict(
+                    "conflict: canvas write does not supersede the current head".into(),
+                ));
+            }
+            buzz_db::ChannelHeadWriteStatus::Inserted => (stored_event, true),
+            buzz_db::ChannelHeadWriteStatus::Duplicate => (stored_event, false),
+        }
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         match state
@@ -2976,7 +3354,7 @@ async fn ingest_event_inner(
         });
     }
 
-    if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
+    if !workflow_deletion && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
         if let Err(e) =
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await
@@ -3054,7 +3432,7 @@ async fn ingest_event_inner(
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use std::sync::Mutex;
 
     use super::*;
@@ -3065,6 +3443,61 @@ mod tests {
         KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
+
+    #[test]
+    fn missing_huddle_backing_channel_is_a_client_rejection() {
+        let channel_id = Uuid::new_v4();
+        assert!(matches!(
+            map_huddle_backing_channel_error(buzz_db::DbError::ChannelNotFound(channel_id)),
+            IngestError::Rejected(message) if message.contains("backing channel not found")
+        ));
+    }
+
+    #[test]
+    fn huddle_backing_channel_lookup_outage_is_internal() {
+        let error = sqlx::Error::Io(std::io::Error::other("database unavailable"));
+        assert!(matches!(
+            map_huddle_backing_channel_error(buzz_db::DbError::Sqlx(error)),
+            IngestError::Internal(message) if message.contains("loading Huddle backing channel")
+        ));
+    }
+
+    #[test]
+    fn huddle_backing_ttl_honors_the_ephemeral_override() {
+        assert_eq!(expected_huddle_backing_ttl(None), 3600);
+        assert_eq!(expected_huddle_backing_ttl(Some(60)), 60);
+    }
+
+    #[test]
+    fn huddle_lifecycle_requires_a_uuid_backing_channel() {
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_HUDDLE_STARTED as u16),
+            r#"{"ephemeral_channel_id":"not-a-uuid"}"#,
+        )
+        .sign_with_keys(&nostr::Keys::generate())
+        .expect("sign Huddle event");
+
+        assert!(matches!(
+            huddle_backing_channel_id(&event),
+            Err(IngestError::Rejected(message)) if message.contains("must be a UUID")
+        ));
+    }
+
+    #[test]
+    fn huddle_lifecycle_extracts_the_backing_channel() {
+        let channel_id = Uuid::new_v4();
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_HUDDLE_ENDED as u16),
+            serde_json::json!({"ephemeral_channel_id": channel_id}).to_string(),
+        )
+        .sign_with_keys(&nostr::Keys::generate())
+        .expect("sign Huddle event");
+
+        assert_eq!(
+            huddle_backing_channel_id(&event).expect("channel id"),
+            channel_id
+        );
+    }
 
     #[test]
     fn reaction_validation_accepts_wrapped_max_shortcode() {
@@ -3252,7 +3685,9 @@ mod tests {
             .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
         let pool = sqlx::PgPool::connect(&url).await.expect("connect test DB");
         let db = buzz_db::Db::from_pool(pool);
-        db.migrate().await.expect("migrate test DB");
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate().await.expect("migrate test DB");
+        }
         let store = buzz_deletion::store(&db);
 
         let host = format!("lane3-fence-{}.example", Uuid::new_v4().simple());
@@ -5244,5 +5679,605 @@ mod tests {
             counts.get(&("ws".to_owned(), "invalid".to_owned())),
             Some(&1)
         );
+    }
+
+    /// Boundary regression for the canvas-specific ingest future-timestamp guard.
+    /// `validate_canvas_future_timestamp` is the pure seam; mutation: changing
+    /// `CANVAS_MAX_INGEST_FUTURE_SECS` to 900 or removing the guard makes the
+    /// "at ceiling + 1" case pass when it must not.
+    ///
+    /// Fixed-literal contract (pinned so constant mutations go red): the relay
+    /// canvas bound IS 300 s; now+300 accepted, now+301 rejected. The relay
+    /// general bound is 900 s (a separate guard); the client ceiling is 60 s
+    /// (CANVAS_MAX_FUTURE_SKEW_SECS in buzz-sdk). Mutating the 300 s constant
+    /// back to 900 makes the numeric assertions below fail.
+    #[test]
+    fn canvas_ingest_future_timestamp_boundary() {
+        let now = 1_700_000_000i64;
+
+        // Exactly at the ceiling: accepted.
+        assert!(
+            validate_canvas_future_timestamp(now + CANVAS_MAX_INGEST_FUTURE_SECS, now).is_ok(),
+            "canvas event at now+300 is within the relay canvas future bound"
+        );
+
+        // One second past the ceiling: rejected.
+        assert!(
+            validate_canvas_future_timestamp(now + CANVAS_MAX_INGEST_FUTURE_SECS + 1, now).is_err(),
+            "canvas event at now+301 exceeds the relay canvas future bound and must be rejected"
+        );
+
+        // Past the general ±900 s window: also rejected (guard fires first).
+        assert!(
+            validate_canvas_future_timestamp(now + 901, now).is_err(),
+            "canvas event at now+901 exceeds both the canvas bound and the general drift window"
+        );
+
+        // In the past: accepted (canvas guard is future-only; general past check is separate).
+        assert!(
+            validate_canvas_future_timestamp(now - 1, now).is_ok(),
+            "canvas event in the past is not affected by the future-timestamp guard"
+        );
+
+        // Fixed-literal contract: relay canvas bound IS 300 s, NOT 900 s.
+        // Mutating CANVAS_MAX_INGEST_FUTURE_SECS back to 900 makes these fail.
+        assert!(
+            validate_canvas_future_timestamp(now + 300, now).is_ok(),
+            "now+300: accepted at the 300 s relay canvas ceiling"
+        );
+        assert!(
+            validate_canvas_future_timestamp(now + 301, now).is_err(),
+            "now+301: rejected one second past the 300 s relay canvas ceiling"
+        );
+        // The old 900 s value must be rejected by this guard.
+        assert!(
+            validate_canvas_future_timestamp(now + 900, now).is_err(),
+            "now+900 must be rejected by the 300 s relay canvas ceiling"
+        );
+    }
+
+    /// Standalone numeric contract for the relay-side canvas ingest guard.
+    ///
+    /// No constants used — if CANVAS_MAX_INGEST_FUTURE_SECS changes, this test
+    /// catches it regardless of whether constant-based assertions remain
+    /// self-consistent. The relay canvas ceiling IS 300 s: now+300 is the last
+    /// accepted timestamp; now+301 is the first rejected timestamp.
+    #[test]
+    fn canvas_ingest_numeric_contract() {
+        let now = 1_700_000_000i64;
+        // These assertions use only fixed numeric literals; they cannot be
+        // self-referential regardless of what CANVAS_MAX_INGEST_FUTURE_SECS holds.
+        assert!(
+            validate_canvas_future_timestamp(now + 300, now).is_ok(),
+            "now+300 must be accepted: relay canvas ceiling is 300 s",
+        );
+        assert!(
+            validate_canvas_future_timestamp(now + 301, now).is_err(),
+            "now+301 must be rejected: one second past the 300 s relay canvas ceiling",
+        );
+        // Old 900 s value must also be rejected (prevents silent reversion to
+        // the general drift bound).
+        assert!(
+            validate_canvas_future_timestamp(now + 900, now).is_err(),
+            "now+900 must be rejected: the general 900 s bound does not apply to canvas events",
+        );
+    }
+
+    /// Ingest-path wiring regression: the kind-40100 canvas future-timestamp
+    /// guard in `ingest_event_inner` must be exercised through the real ingest
+    /// path, not only the pure `validate_canvas_future_timestamp` helper.
+    ///
+    /// A signed kind-40100 event with `created_at = relay_now + 600` is
+    /// submitted through `ingest_event_inner`. The offset is chosen to be
+    /// well inside the guard's rejection zone (300 s ceiling) so that
+    /// scheduler latency between test setup and production's `Utc::now()`
+    /// re-sample cannot shrink the apparent offset to within 300 s and
+    /// accidentally let the event through. Exact 300/301 boundary coverage
+    /// lives in `canvas_ingest_numeric_contract` and
+    /// `canvas_ingest_future_timestamp_boundary`, which exercise the pure
+    /// `validate_canvas_future_timestamp` helper with fixed arguments.
+    ///
+    /// Mutation oracle: deleting the `if kind_u32 == KIND_CANVAS { … }` call
+    /// site in `ingest_event_inner` changes the rejection reason to the h-tag
+    /// check ("channel-scoped events must include an h tag"), causing this
+    /// assertion to fail.
+    ///
+    /// Infrastructure: a real Postgres is required to pass the community
+    /// deletion-fence check that precedes the canvas guard. Redis is not
+    /// needed — the canvas guard fires before any Redis-backed path.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn canvas_ingest_guard_wired_through_ingest_event_inner() {
+        use buzz_auth::Nip98ReplayGuard;
+        use nostr::{Keys, Kind, Timestamp};
+
+        const FAKE_REDIS_URL: &str = "redis://127.0.0.1:1"; // no Redis needed for this path
+
+        // ── Postgres connection ──────────────────────────────────────────────
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let pool = sqlx::PgPool::connect(&db_url).await.expect(
+            "connect test Postgres — start local Postgres before running ignored ingest tests",
+        );
+        let db = buzz_db::Db::from_pool(pool.clone());
+        // Do not call db.migrate() here: CI migrates the schema before running
+        // integration tests; calling migrate() locally risks version conflicts
+        // if the DB was provisioned via a different path.
+
+        // ── AppState ─────────────────────────────────────────────────────────
+        // Redis is lazy and never actually contacted on this rejection path.
+        let redis_pool = deadpool_redis::Config::from_url(FAKE_REDIS_URL)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("deadpool redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(FAKE_REDIS_URL, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let mut config = crate::config::Config::from_env().expect("relay config from env");
+        config.database_url = db_url.clone();
+        config.redis_url = FAKE_REDIS_URL.to_string();
+        config.require_relay_membership = false;
+
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth_svc = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+
+        let (mut state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db.clone(),
+            redis_pool,
+            audit,
+            pubsub,
+            auth_svc,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+
+        // Replace the NIP-98 replay guard so no live Redis is required.
+        struct AlwaysFreshReplayGuard;
+        impl Nip98ReplayGuard for AlwaysFreshReplayGuard {
+            fn try_mark_in_scope<'a>(
+                &'a self,
+                _scope: &'a str,
+                _event_id: &'a nostr::EventId,
+                _ttl_secs: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(true) })
+            }
+        }
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        let state = Arc::new(state);
+
+        // ── Provision a fresh community so the deletion fence allows writes ──
+        let host = format!("canvas-ts-guard-{}.test", Uuid::new_v4().simple());
+        let community = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+
+        // ── Build a kind-40100 event 600 seconds in the future ───────────────
+        // +600 is well inside the guard's rejection zone (>300 s), so scheduler
+        // latency between this Utc::now() call and production's independent
+        // Utc::now() re-sample inside ingest_event_inner cannot close the gap
+        // to within 300 s. Exact 300/301 boundary assertions live in the pure
+        // `validate_canvas_future_timestamp` tests which have no clock race.
+        let keys = Keys::generate();
+        let relay_now = chrono::Utc::now().timestamp() as u64;
+        let event = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "")
+            .custom_created_at(Timestamp::from(relay_now + 600))
+            .sign_with_keys(&keys)
+            .expect("sign canvas event");
+
+        let auth = IngestAuth::Http {
+            pubkey: keys.public_key(),
+            scopes: vec![Scope::ChannelsWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
+
+        // ── Submit through the real ingest path ───────────────────────────────
+        let result = ingest_event_inner(&state, &tracer, &tenant, event, auth).await;
+
+        // The canvas-specific guard must fire before the h-tag check.
+        // created_at = relay_now + 600 is 300 s above the canvas ceiling, so
+        // even under heavy load the guard fires and rejects with this message.
+        //
+        // Mutation oracle: delete `if kind_u32 == KIND_CANVAS { … }` in
+        // ingest_event_inner → no canvas guard fires → the event reaches the
+        // h-tag check → Rejected("invalid: channel-scoped events must include
+        // an h tag") → assert! below fails.
+        let err = match result {
+            Ok(_) => panic!(
+                "kind-40100 event at now+600 must be rejected, but ingest_event_inner returned Ok"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, IngestError::Rejected(msg) if msg.contains("canvas event timestamp too far in the future")),
+            "rejection must be the canvas guard, not the h-tag check; \
+             deleting the guard call site changes this error to the h-tag rejection. \
+             Got: {err:?}",
+        );
+    }
+
+    // ── parse_canvas_expected_revision unit tests ─────────────────────────
+    //
+    // These cover every branch in the parser without requiring Postgres or
+    // Redis.  A helper builds a signed kind-40100 event from a tag-list so the
+    // tests only state the tags they care about.
+
+    /// Build a signed kind-40100 event carrying the given tags.  The event is
+    /// fully signed so the nostr library populates `tags` correctly; content
+    /// and timestamp are irrelevant for the parser.
+    fn canvas_event_with_tags(tags: impl IntoIterator<Item = nostr::Tag>) -> nostr::Event {
+        use nostr::{EventBuilder, Keys, Kind};
+        EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .expect("sign canvas event for parser test")
+    }
+
+    /// No `expected-revision` tag → `Ok(None)` (backward-compatible unconditional
+    /// append; mutation: adding a spurious tag-match makes the call return
+    /// `Some`, changing the Ok(None) assertion to fail).
+    #[test]
+    fn parse_canvas_revision_absent_returns_none() {
+        let event = canvas_event_with_tags([nostr::Tag::parse(["h", "chan-uuid"]).unwrap()]);
+        let result = parse_canvas_expected_revision(&event);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    /// `expected-revision = "none"` → `Ok(Some(NoHead))` (first-create
+    /// precondition; mutation: changing `"none"` check to `"NONE"` makes the
+    /// parser fall through to the hex decoder and return `Rejected`).
+    #[test]
+    fn parse_canvas_revision_none_literal_yields_no_head() {
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", "none"]).unwrap()]);
+        assert_eq!(
+            parse_canvas_expected_revision(&event).unwrap(),
+            Some(CanvasRevisionSpec::NoHead),
+        );
+    }
+
+    /// A well-formed 64-hex event ID → `Ok(Some(Head(bytes)))` where the
+    /// bytes equal the decoded hex (mutation: changing `bytes.len() == 32`
+    /// to `!= 32` makes this return `Rejected`).
+    #[test]
+    fn parse_canvas_revision_valid_hex_yields_head() {
+        let hex_id = "a".repeat(64);
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", &hex_id]).unwrap()]);
+        let spec = parse_canvas_expected_revision(&event)
+            .expect("valid hex must parse")
+            .expect("must be Some");
+        assert_eq!(spec, CanvasRevisionSpec::Head(vec![0xaa; 32]));
+    }
+
+    /// Two `expected-revision` tags → `Rejected("invalid: duplicate …")`.
+    /// Mutation: removing the `tags.next().is_some()` guard makes this return
+    /// `Ok(Some(…))` instead.
+    #[test]
+    fn parse_canvas_revision_duplicate_tag_rejects() {
+        let hex_id = "b".repeat(64);
+        let event = canvas_event_with_tags([
+            nostr::Tag::parse(["expected-revision", &hex_id]).unwrap(),
+            nostr::Tag::parse(["expected-revision", &hex_id]).unwrap(),
+        ]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("duplicate expected-revision tag")
+            ),
+            "duplicate tags must be rejected",
+        );
+    }
+
+    /// A one-element `["expected-revision"]` tag (no value) → `Rejected`.
+    /// Mutation: changing `tag.len() != 2` to `< 2` also catches zero-element
+    /// forms but not three-element; this case specifically exercises the
+    /// `len == 1` branch.
+    #[test]
+    fn parse_canvas_revision_missing_value_rejects() {
+        // nostr::Tag::parse requires ≥1 element; build a tag with only the key.
+        let event = canvas_event_with_tags([nostr::Tag::parse(["expected-revision"]).unwrap()]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("expected-revision tag must have exactly one value")
+            ),
+            "tag with no value must be rejected",
+        );
+    }
+
+    /// A three-element `["expected-revision", value, extra]` tag → `Rejected`.
+    /// Mutation: changing `tag.len() != 2` to `tag.len() < 2` lets three-element
+    /// tags through; this test catches that.
+    #[test]
+    fn parse_canvas_revision_extra_value_rejects() {
+        let hex_id = "c".repeat(64);
+        let event =
+            canvas_event_with_tags([
+                nostr::Tag::parse(["expected-revision", &hex_id, "extra"]).unwrap()
+            ]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("expected-revision tag must have exactly one value")
+            ),
+            "tag with extra value must be rejected",
+        );
+    }
+
+    /// A 62-character hex string (too short — not a 32-byte id) → `Rejected`.
+    /// Mutation: removing the `bytes.len() == 32` length check makes this return
+    /// `Ok(Some(Head(…)))` with 31 bytes instead of rejecting.
+    #[test]
+    fn parse_canvas_revision_too_short_hex_rejects() {
+        let short_hex = "d".repeat(62);
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", &short_hex]).unwrap()]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("bad expected canvas revision")
+            ),
+            "too-short hex must be rejected",
+        );
+    }
+
+    /// A non-hex value → `Rejected("invalid: bad expected canvas revision")`.
+    /// Mutation: removing `hex::decode(value).ok()` makes this panic instead.
+    #[test]
+    fn parse_canvas_revision_non_hex_rejects() {
+        let not_hex = "g".repeat(64); // 'g' is not a valid hex digit
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", &not_hex]).unwrap()]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("bad expected canvas revision")
+            ),
+            "non-hex value must be rejected",
+        );
+    }
+
+    // ── CAS ingest-path wiring test ───────────────────────────────────────
+    //
+    // Proves that the `expected-revision` parser → dispatch → DB transaction
+    // round-trip is wired end-to-end through `ingest_event_inner`. Deletng or
+    // bypassing the CAS dispatch block (the `} else if let Some(spec) =
+    // canvas_revision_spec.as_ref() {` branch) must turn this test red.
+    //
+    // Mutation oracle for the dispatch:
+    //   - Removing the `canvas_revision_spec` branch makes tagged writes fall
+    //     through to the generic append; the stale-head step no longer returns
+    //     a conflict: rejection, causing the assert! below to fail.
+    //   - Replacing `insert_channel_head_checked` with `insert_event_with_thread_metadata`
+    //     has the same effect — no conflict is surfaced.
+    //
+    // Requires Postgres (and does NOT need Redis — the fake replay guard fires
+    // before any Redis-backed path, and the CAS path never touches Redis).
+
+    /// Build the minimal AppState for an ingest-path CAS test.
+    ///
+    /// Replaces the NIP-98 replay guard with an always-fresh stub so that no
+    /// live Redis is needed. The returned `AppState` is ready for
+    /// `ingest_event_inner` calls.
+    async fn build_canvas_ingest_state(
+        db_url: &str,
+        pool: &sqlx::PgPool,
+    ) -> Arc<crate::state::AppState> {
+        use buzz_auth::Nip98ReplayGuard;
+        use nostr::Keys;
+
+        const FAKE_REDIS_URL: &str = "redis://127.0.0.1:1"; // never contacted
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(FAKE_REDIS_URL)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("deadpool redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(FAKE_REDIS_URL, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let mut config = crate::config::Config::from_env().expect("relay config from env");
+        config.database_url = db_url.to_owned();
+        config.redis_url = FAKE_REDIS_URL.to_string();
+        config.require_relay_membership = false;
+
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth_svc = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+
+        let (mut state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db.clone(),
+            redis_pool,
+            audit,
+            pubsub,
+            auth_svc,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+
+        struct AlwaysFresh;
+        impl Nip98ReplayGuard for AlwaysFresh {
+            fn try_mark_in_scope<'a>(
+                &'a self,
+                _scope: &'a str,
+                _event_id: &'a nostr::EventId,
+                _ttl_secs: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(true) })
+            }
+        }
+        state.nip98_replay = Arc::new(AlwaysFresh);
+        Arc::new(state)
+    }
+
+    /// End-to-end CAS dispatch wiring: a tagged write inserts, a stale same-head
+    /// competitor returns the exact conflict: rejection, the loser is absent from
+    /// the DB, and an untagged write still appends unconditionally.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn canvas_cas_dispatch_wired_through_ingest_event_inner() {
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use nostr::{Keys, Kind, Tag, Timestamp};
+
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let pool = sqlx::PgPool::connect(&db_url).await.expect(
+            "connect test Postgres — start local Postgres before running ignored ingest tests",
+        );
+        let state = build_canvas_ingest_state(&db_url, &pool).await;
+
+        // Provision a fresh community + channel so each test run is isolated.
+        let host = format!("canvas-cas-wiring-{}.test", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+
+        let channel_id = Uuid::new_v4();
+        let creator_keys = Keys::generate();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                channel_id,
+                &format!("canvas-cas-wiring-{}", channel_id.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                creator_keys.public_key().to_bytes().as_slice(),
+                None,
+            )
+            .await
+            .expect("create test channel");
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let channel_uuid_str = channel_id.to_string();
+        let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
+
+        let make_auth = |keys: &Keys| IngestAuth::Http {
+            pubkey: keys.public_key(),
+            scopes: vec![Scope::ChannelsWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+
+        // ── Step 1: first write with expected-revision=none → Inserted ────────
+        let author = Keys::generate();
+        let first = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# v1")
+            .custom_created_at(Timestamp::from(now))
+            .tags([
+                Tag::parse(["h", &channel_uuid_str]).unwrap(),
+                Tag::parse(["expected-revision", "none"]).unwrap(),
+            ])
+            .sign_with_keys(&author)
+            .expect("sign first canvas");
+        let first_id_hex = first.id.to_hex();
+
+        ingest_event_inner(&state, &tracer, &tenant, first, make_auth(&author))
+            .await
+            .expect("first canvas write must succeed");
+
+        // ── Step 2: advance with expected-revision=<first id> → Inserted ──────
+        let second = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# v2")
+            .custom_created_at(Timestamp::from(now + 1))
+            .tags([
+                Tag::parse(["h", &channel_uuid_str]).unwrap(),
+                Tag::parse(["expected-revision", &first_id_hex]).unwrap(),
+            ])
+            .sign_with_keys(&author)
+            .expect("sign second canvas");
+
+        ingest_event_inner(&state, &tracer, &tenant, second, make_auth(&author))
+            .await
+            .expect("second canvas write must succeed");
+
+        // ── Step 3: stale competitor — same first-id precondition → conflict ──
+        // The head is now the second event, so expected-revision=<first_id> is stale.
+        // Mutation oracle: deleting the `canvas_revision_spec` dispatch block makes
+        // this return Ok instead of the conflict: rejection below.
+        let stale = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# stale")
+            .custom_created_at(Timestamp::from(now + 2))
+            .tags([
+                Tag::parse(["h", &channel_uuid_str]).unwrap(),
+                Tag::parse(["expected-revision", &first_id_hex]).unwrap(),
+            ])
+            .sign_with_keys(&author)
+            .expect("sign stale canvas");
+        let stale_id_bytes = stale.id.as_bytes().to_vec();
+
+        let err =
+            match ingest_event_inner(&state, &tracer, &tenant, stale, make_auth(&author)).await {
+                Ok(_) => panic!("stale precondition must be rejected, but ingest returned Ok"),
+                Err(e) => e,
+            };
+        assert!(
+            matches!(&err, IngestError::CanvasConflict(msg) if msg.starts_with("conflict:")),
+            "stale write must return a canvas conflict: rejection; got {:?}",
+            err,
+        );
+
+        // The losing write must not be persisted.
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community.as_uuid())
+                .bind(stale_id_bytes.as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count stale canvas row");
+        assert_eq!(persisted, 0, "losing CAS write must not be stored");
+
+        // ── Step 4: untagged write still appends unconditionally ──────────────
+        // No expected-revision tag → the event is routed through the generic
+        // append path, NOT through insert_channel_head_checked. It must succeed
+        // regardless of the current head state.
+        let untagged =
+            nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# unconditional")
+                .custom_created_at(Timestamp::from(now + 3))
+                .tags([Tag::parse(["h", &channel_uuid_str]).unwrap()])
+                .sign_with_keys(&author)
+                .expect("sign untagged canvas");
+
+        ingest_event_inner(&state, &tracer, &tenant, untagged, make_auth(&author))
+            .await
+            .expect("untagged canvas write must append unconditionally");
     }
 }
