@@ -1034,6 +1034,44 @@ fn workspace_pair_key_is_canonical() {
 }
 
 #[test]
+fn spawn_connection_preserves_the_bound_loopback_host() {
+    // Runtime identity deliberately folds loopback spellings together so one
+    // agent cannot spawn twice for localhost vs 127.0.0.1. The transport URL
+    // must remain the caller-bound workspace spelling because the relay Host
+    // header selects the community.
+    let pubkey = "aa".repeat(32);
+    let configured = "ws://localhost:3000";
+    let target = super::resolve_spawn_relay_target(&pubkey, configured).unwrap();
+    let mut command = std::process::Command::new("probe");
+    target.apply_to_command(&mut command);
+    let relay_env = command
+        .get_envs()
+        .find_map(|(key, value)| {
+            (key == "BUZZ_RELAY_URL").then(|| value.and_then(|value| value.to_str()))
+        })
+        .flatten();
+
+    assert_eq!(target.runtime_key.relay_url, "ws://127.0.0.1:3000");
+    assert_eq!(target.connection_url, "ws://localhost:3000");
+    assert_eq!(relay_env, Some("ws://localhost:3000"));
+}
+
+#[test]
+fn restart_targets_preserve_the_spawned_connection_host() {
+    let pubkey = "cc".repeat(32);
+    let key = super::ManagedAgentRuntimeKey::new(&pubkey, "ws://localhost:3000").unwrap();
+    assert_eq!(key.relay_url, "ws://127.0.0.1:3000");
+    let mut runtime = make_pair_runtime_placeholder();
+    runtime.spawn_config.relay_url = "ws://localhost:3000".to_string();
+    let runtimes = std::collections::HashMap::from([(key, runtime)]);
+
+    assert_eq!(
+        super::managed_agent_runtime_connection_urls(&runtimes, &pubkey),
+        vec!["ws://localhost:3000"]
+    );
+}
+
+#[test]
 fn invalid_pubkey_resolves_no_pair_key() {
     // Key-less records (keys minted on first start) cannot form a pair key;
     // the summary must fall back to the stopped/legacy-pid path, not panic.

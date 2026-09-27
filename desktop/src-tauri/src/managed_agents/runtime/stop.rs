@@ -19,6 +19,22 @@ pub(crate) fn managed_agent_runtime_keys<T>(
         .collect()
 }
 
+/// Return the configured connection URL for each live pair of `pubkey`.
+///
+/// Runtime-map keys are canonical identities and may fold loopback hostnames.
+/// Restart paths must instead reconnect with the URL stamped at spawn time so
+/// the relay Host header continues to select the same community.
+pub(crate) fn managed_agent_runtime_connection_urls(
+    runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    pubkey: &str,
+) -> Vec<String> {
+    runtimes
+        .iter()
+        .filter(|(key, _)| key.pubkey.eq_ignore_ascii_case(pubkey))
+        .map(|(_, runtime)| runtime.spawn_config.relay_url.clone())
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn managed_agent_runtime_relay_urls<T>(
     runtimes: &HashMap<ManagedAgentRuntimeKey, T>,
