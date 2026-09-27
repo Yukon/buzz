@@ -418,7 +418,8 @@ pub async fn restore_managed_agents_on_launch(
                 record.last_stopped_at = None;
                 record.last_exit_code = None;
                 record.last_error = None;
-                successfully_spawned.push(track_restored_runtime(&mut runtimes, key, *process));
+                let connect_relay_url = track_restored_runtime(&mut runtimes, key, *process);
+                successfully_spawned.push((pubkey, connect_relay_url));
             }
             SpawnOutcome::Failed(error) => {
                 let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
@@ -626,8 +627,8 @@ fn track_restored_runtime(
     >,
     key: super::ManagedAgentRuntimeKey,
     process: ManagedAgentProcess,
-) -> (String, String) {
-    let reconcile_target = (key.pubkey.clone(), process.connect_relay_url.clone());
+) -> String {
+    let reconcile_target = process.connect_relay_url.clone();
     runtimes.insert(key, super::ManagedAgentPairRuntime::starting(process));
     reconcile_target
 }
@@ -645,9 +646,7 @@ mod relay_target_tests {
         finish_relay_target_process(&mut process);
         let key = ManagedAgentRuntimeKey::new(&record.pubkey, target).unwrap();
         let mut runtimes = std::collections::HashMap::new();
-        let (pubkey, reconcile_url) =
-            super::track_restored_runtime(&mut runtimes, key.clone(), process);
-        assert_eq!(pubkey, record.pubkey);
+        let reconcile_url = super::track_restored_runtime(&mut runtimes, key.clone(), process);
         assert_eq!(reconcile_url, target);
         assert_eq!(runtimes[&key].connect_relay_url, target);
         assert_eq!(runtimes[&key].spawn_config.relay_url, key.relay_url);
