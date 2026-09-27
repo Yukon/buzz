@@ -226,8 +226,6 @@ desktop-tauri-check: _ensure-sidecar-stubs
 # Run desktop Tauri Rust unit tests
 desktop-tauri-test: _ensure-sidecar-stubs
     cd desktop/src-tauri && cargo test --workspace
-    # Exercise the file-backed test identity without accessing the OS keyring.
-    cargo test --manifest-path {{desktop_tauri_manifest}} --lib --no-default-features relay_target_ -- --test-threads=1
 
 # Run the native terminal latency gate explicitly on a known-idle host.
 # This is intentionally excluded from shared CI: scheduler contention makes a

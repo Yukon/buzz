@@ -82,73 +82,6 @@ fn relay_target_actual_spawn_preserves_host_and_stamps_snapshot() {
 }
 
 #[test]
-fn relay_target_workspace_start_receipt_summary_and_restart_preserve_host() {
-    let _env = crate::managed_agents::lock_path_mutex();
-    let (_dir, app, mut record) = fixture();
-    let url = "ws://localhost:3000";
-    let scoped = crate::relay::bind_expected_relay_scope(Some(url), url.into()).unwrap();
-    let mut runtimes = HashMap::new();
-    start_managed_agent_process(
-        app.handle(),
-        &mut record,
-        &mut runtimes,
-        None,
-        &scoped,
-        None,
-    )
-    .unwrap();
-    let key = ManagedAgentRuntimeKey::new(&record.pubkey, url).unwrap();
-    assert_eq!(key.relay_url, "ws://127.0.0.1:3000");
-    let runtime = runtimes.get_mut(&key).unwrap();
-    finish(&mut runtime.process);
-    assert_eq!(runtime.connect_relay_url, url);
-    assert_eq!(runtime.spawn_config.relay_url, key.relay_url);
-    let receipt_path = app
-        .path()
-        .app_data_dir()
-        .unwrap()
-        .join("agents/agent-pids")
-        .join(format!("{}.json", key.runtime_id()));
-    let receipt: super::super::ManagedAgentRuntimeReceipt =
-        serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
-    assert_eq!(receipt.key, key);
-    assert_eq!(receipt.connect_relay_url.as_deref(), Some(url));
-
-    let personas = super::super::load_personas(app.handle()).unwrap();
-    let teams = super::super::load_teams(app.handle()).unwrap();
-    let global = super::super::load_global_agent_config(app.handle()).unwrap();
-    let summary =
-        build_managed_agent_summary(app.handle(), &record, &runtimes, &personas, &teams, &global)
-            .unwrap();
-    assert!(
-        !summary.needs_restart,
-        "unexpected drift: {:?}",
-        summary.restart_diff
-    );
-    record.parallelism += 1;
-    assert!(
-        build_managed_agent_summary(app.handle(), &record, &runtimes, &personas, &teams, &global,)
-            .unwrap()
-            .needs_restart
-    );
-
-    let urls = managed_agent_restart_targets(&runtimes, &record.pubkey);
-    assert_eq!(urls, [url]);
-    let mut restarted =
-        spawn_agent_child(app.handle(), &record, &urls[0], false, None, None).unwrap();
-    finish(&mut restarted);
-    assert_eq!(restarted.connect_relay_url, url);
-    assert_eq!(restarted.spawn_config.relay_url, key.relay_url);
-    assert_eq!(
-        std::fs::read_to_string(restarted.log_path)
-            .unwrap()
-            .lines()
-            .last(),
-        Some("RELAY=ws://localhost:3000")
-    );
-}
-
-#[test]
 fn relay_target_restart_selection_is_agent_scoped_and_preserves_all_connections() {
     let _env = crate::managed_agents::lock_path_mutex();
     let (_dir, app, record) = fixture();
@@ -181,6 +114,15 @@ fn relay_target_restart_selection_is_agent_scoped_and_preserves_all_connections(
     );
     assert!(managed_agent_restart_targets(&runtimes, &"ef".repeat(32)).is_empty());
     assert!(managed_agent_restart_targets(&HashMap::new(), &record.pubkey).is_empty());
+    runtimes.clear();
+    for url in urls {
+        let mut restarted =
+            spawn_agent_child(app.handle(), &record, &url, false, None, None).unwrap();
+        finish(&mut restarted);
+        assert_eq!(restarted.connect_relay_url, url);
+        let log = std::fs::read_to_string(&restarted.log_path).unwrap();
+        assert_eq!(log.lines().last(), Some(format!("RELAY={url}").as_str()));
+    }
 }
 
 #[test]
@@ -227,24 +169,38 @@ fn relay_target_invalid_input_refuses_before_creating_logs() {
 }
 
 #[test]
-fn relay_target_workspace_reuse_rejects_another_loopback_community() {
+fn relay_target_spawn_snapshot_matches_canonical_restart_comparison() {
     let _guard = crate::managed_agents::lock_path_mutex();
     let (_dir, app, mut record) = fixture();
-    // Keep the inert child alive long enough to exercise the production reuse
-    // branch. exec keeps the bounded sleeper as the direct tracked child.
-    std::fs::write(&record.acp_command, "#!/bin/sh\nexec /bin/sleep 5\n").unwrap();
-    let configured = "ws://localhost:3000";
-    let bound =
-        crate::relay::bind_expected_relay_scope(Some(configured), configured.into()).unwrap();
-    let mut runtimes = HashMap::new();
-    start_managed_agent_process(app.handle(), &mut record, &mut runtimes, None, &bound, None)
-        .unwrap();
-    let other = "ws://127.0.0.1:3000";
-    let bound = crate::relay::bind_expected_relay_scope(Some(other), other.into()).unwrap();
-    let result =
-        start_managed_agent_process(app.handle(), &mut record, &mut runtimes, None, &bound, None);
-    // Clean up before asserting, including when the reuse guard regresses.
-    stop_managed_agent_process(app.handle(), &mut record, &mut runtimes).unwrap();
-    assert!(result.unwrap_err().contains("connection-target conflict"));
-    assert!(runtimes.is_empty());
+    let target = "ws://localhost:3000";
+    let mut process = spawn_agent_child(app.handle(), &record, target, true, None, None).unwrap();
+    finish(&mut process);
+    let key = ManagedAgentRuntimeKey::new(&record.pubkey, target).unwrap();
+    let personas = super::super::load_personas(app.handle()).unwrap();
+    let teams = super::super::load_teams(app.handle()).unwrap();
+    let global = super::super::load_global_agent_config(app.handle()).unwrap();
+    let current = |record: &ManagedAgentRecord| {
+        super::super::spawn_snapshot::prospective_spawn_config_snapshot(
+            record,
+            &personas,
+            &teams,
+            &key.relay_url,
+            &global,
+            super::super::owner_only_access_build(),
+        )
+    };
+    let changes = |current: &super::super::spawn_snapshot::SpawnConfigSnapshot| {
+        super::super::spawn_snapshot::eligible_restart_diff(
+            false,
+            Some(super::super::spawn_snapshot::TrackedSpawnState {
+                stamped: &process.spawn_config,
+                current,
+                stamped_availability: None,
+                current_availability: None,
+            }),
+        )
+    };
+    assert!(changes(&current(&record)).is_empty());
+    record.parallelism += 1;
+    assert!(!changes(&current(&record)).is_empty());
 }

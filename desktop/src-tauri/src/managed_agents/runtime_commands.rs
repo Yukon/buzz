@@ -15,8 +15,8 @@ use crate::app_state::AppState;
 
 const STATUS_EVENT: &str = "managed-agent-runtime-status";
 
-fn status_for<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+fn status_for(
+    app: &AppHandle,
     record: &super::ManagedAgentRecord,
     key: &ManagedAgentRuntimeKey,
     runtime: Option<&ManagedAgentPairRuntime>,
@@ -44,8 +44,8 @@ struct StatusInputs<'a> {
     global: &'a super::GlobalAgentConfig,
 }
 
-fn status_for_with<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+fn status_for_with(
+    app: &AppHandle,
     record: &super::ManagedAgentRecord,
     key: &ManagedAgentRuntimeKey,
     runtime: Option<&ManagedAgentPairRuntime>,
@@ -78,7 +78,7 @@ fn status_for_with<R: tauri::Runtime>(
     }
 }
 
-fn emit_status<R: tauri::Runtime>(app: &AppHandle<R>, status: &ManagedAgentRuntimeStatus) {
+fn emit_status(app: &AppHandle, status: &ManagedAgentRuntimeStatus) {
     let _ = app.emit(STATUS_EVENT, status);
 }
 
@@ -246,12 +246,12 @@ pub fn start_managed_agent_runtime(
     start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app)
 }
 
-fn start_pair<R: tauri::Runtime>(
+fn start_pair(
     pubkey: String,
     relay_url: String,
     lazy: bool,
     expected_updated_at: Option<&str>,
-    app: AppHandle<R>,
+    app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
     let _transition = state
@@ -477,9 +477,9 @@ fn unkeyable_failed_status(
 /// agents the user chose *not* to auto-start would contradict that choice, so
 /// reconcile leaves them alone until something explicitly asks for them.
 #[tauri::command]
-pub async fn reconcile_managed_agent_runtimes<R: tauri::Runtime>(
+pub async fn reconcile_managed_agent_runtimes(
     communities: Vec<super::ManagedAgentCommunityTarget>,
-    app: AppHandle<R>,
+    app: AppHandle,
 ) -> Result<Vec<ManagedAgentRuntimeStatus>, String> {
     use futures_util::{stream, StreamExt};
 

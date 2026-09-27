@@ -82,10 +82,7 @@ fn is_safe_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
-pub fn managed_agent_log_path<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    pubkey: &str,
-) -> Result<PathBuf, String> {
+pub fn managed_agent_log_path(app: &AppHandle, pubkey: &str) -> Result<PathBuf, String> {
     Ok(managed_agents_logs_dir(app)?.join(format!("{pubkey}.log")))
 }
 
@@ -816,8 +813,8 @@ fn agent_pids_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, Stri
 /// Persist a pair-scoped runtime receipt atomically. Callers must register the
 /// process in memory in the same runtime transition; on write failure they must
 /// terminate the child before releasing that transition.
-pub fn write_agent_runtime_receipt<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub fn write_agent_runtime_receipt(
+    app: &AppHandle,
     receipt: &ManagedAgentRuntimeReceipt,
 ) -> Result<(), String> {
     let path = agent_pids_dir(app)?.join(format!("{}.json", receipt.key.runtime_id()));
@@ -839,8 +836,8 @@ pub fn remove_agent_runtime_receipt_path(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-pub fn read_all_agent_runtime_receipts<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub fn read_all_agent_runtime_receipts(
+    app: &AppHandle,
 ) -> Vec<(PathBuf, ManagedAgentRuntimeReceipt)> {
     let Ok(dir) = agent_pids_dir(app) else {
         return Vec::new();

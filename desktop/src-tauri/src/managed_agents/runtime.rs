@@ -119,8 +119,8 @@ pub(crate) use spawn_key::bound_runtime_key;
 /// pin is ignored — see `effective_agent_relay_url`). Returns `None` for
 /// records that cannot form a valid pair key yet (e.g. key-less agents that
 /// mint keys on first start).
-pub(crate) fn workspace_pair_key<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub(crate) fn workspace_pair_key(
+    app: &AppHandle,
     record: &ManagedAgentRecord,
 ) -> Option<ManagedAgentRuntimeKey> {
     let state = app.state::<crate::app_state::AppState>();
@@ -144,8 +144,8 @@ pub(crate) fn resolve_workspace_pair_key(
     ManagedAgentRuntimeKey::new(pubkey.to_string(), &effective_relay).ok()
 }
 
-pub fn build_managed_agent_summary<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub fn build_managed_agent_summary(
+    app: &AppHandle,
     record: &ManagedAgentRecord,
     runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     personas: &[crate::managed_agents::types::AgentDefinition],
@@ -874,8 +874,8 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
 /// exact workspace-relay read the caller's scope assertion passed on; it never
 /// re-reads the mutable override (see `relay::scope`). The key comes from
 /// [`bound_runtime_key`] — the seam the spawn-key regressions exercise.
-pub fn start_managed_agent_process<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub fn start_managed_agent_process(
+    app: &AppHandle,
     record: &mut ManagedAgentRecord,
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     owner_hex: Option<&str>,

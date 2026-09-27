@@ -454,8 +454,8 @@ pub(super) fn terminate_runtime_receipt_with(
 /// the same pair. The caller must hold the runtime transition lock so receipt
 /// inspection, termination, spawn, and registration cannot race shutdown or
 /// another start.
-pub(crate) fn terminate_untracked_pair_runtime<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub(crate) fn terminate_untracked_pair_runtime(
+    app: &AppHandle,
     key: &ManagedAgentRuntimeKey,
 ) -> Result<(), String> {
     let instance_id = current_instance_id(app);

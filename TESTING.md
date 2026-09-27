@@ -367,36 +367,3 @@ CLI-side, only two matter for testing:
 | ACP logs `discovered 0 channel(s)` / `no channel subscriptions resolved` | Agent identity isn't a member of any channel | `buzz channels add-member --channel "$CHANNEL" --pubkey "$AGENT_PUBKEY" --role member` from another identity |
 | `GOOSE_MODE` warning, agent hangs | Not set | `export GOOSE_MODE=auto` |
 | Tests pass locally but CI fails | Forgot to run `just ci` | `just ci` runs the gate (fmt, clippy, unit tests, desktop/web builds) |
-
-## Managed-agent relay host regression
-
-The runtime identity folds loopback spellings together, but connections must
-preserve the workspace host because it selects the community. The
-`relay_target_` tests exercise actual child spawning, workspace-start receipts,
-spawn snapshots and restart badges, restart selection, signed HTTP access
-probes, the startup reconciliation command, signed inbound policy restarts,
-and the restore-to-profile target handoff. They use temporary app storage,
-an inert child executable, and a loopback HTTP fixture.
-
-Runtime keys and spawn snapshots remain canonical. The process's
-`connect_relay_url` and the receipt's optional `connectRelayUrl` retain the
-trimmed configured URL. Legacy receipts without that field remain readable;
-a present URL must canonicalize to the receipt's key. Global configuration,
-ACP installation, access-policy edits, and inbound policy edits must collect
-each live process's connection target before stopping it.
-
-```sh
-cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib relay_target_ -- --test-threads=1
-cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib --no-default-features relay_target_ -- --test-threads=1
-```
-
-The second command includes the reconciliation test, which persists a generated
-test identity. Disabling the system keyring keeps that identity entirely inside
-the temporary app directory. `just desktop-tauri-test` runs this lane, including
-in CI. Child-process cases run on Unix; the HTTP probe also runs on Windows.
-
-These tests do not replace a native-app check of restoring an existing agent
-and restarting it after global configuration, access-policy, persona, or runtime
-installation changes. For a workspace at `ws://localhost:3000`, each new harness
-log must retain that URL, discover the agent's existing channels, and avoid a
-spurious restart-needed badge caused by the URL alone.
