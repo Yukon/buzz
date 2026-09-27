@@ -349,9 +349,7 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                             .lock()
                             .map_err(|error| error.to_string())?;
                         let mut relay_urls =
-                            crate::managed_agents::managed_agent_runtime_connection_urls(
-                                &runtimes, &d_tag,
-                            );
+                            crate::managed_agents::managed_agent_restart_targets(&runtimes, &d_tag);
                         if relay_urls.is_empty() && record.runtime_pid.is_some() {
                             relay_urls.push(crate::relay::effective_agent_relay_url(
                                 &record.relay_url,

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use tauri::{AppHandle, Manager};
 
+pub(crate) use super::agent_env::child_rust_log_filter;
 use super::agent_env::idle_pool_sleep_env;
 
 use crate::{
@@ -59,8 +60,9 @@ fn apply_custom_acp_git_credentials(
 pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondToEnv};
 
 mod metadata;
+use metadata::persona_drift_state;
 pub(crate) use metadata::{
-    apply_agent_display_env, apply_replay_floor_env, child_rust_log_filter, resolve_session_title,
+    apply_agent_display_env, apply_replay_floor_env, resolve_session_title,
     runtime_metadata_env_vars, DISPLAY_NAME_ENV_VAR, REPLAY_FLOOR_ENV_VAR, SESSION_TITLE_ENV_VAR,
 };
 
@@ -68,7 +70,7 @@ mod setup_payload;
 use setup_payload::apply_setup_payload_env;
 
 mod stop;
-pub(crate) use stop::{managed_agent_runtime_connection_urls, managed_agent_runtime_keys};
+pub(crate) use stop::{managed_agent_restart_targets, managed_agent_runtime_keys};
 pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
 
 mod sweep;
@@ -81,8 +83,9 @@ use process::{
     terminate_runtime_receipt_with, valid_agent_runtime_receipt_with,
 };
 pub(crate) use process::{
-    current_instance_id, process_belongs_to_us, process_has_buzz_marker, process_is_running,
-    terminate_process, terminate_untracked_pair_runtime, valid_agent_runtime_receipt,
+    connection_relay_url, current_instance_id, ensure_pair_connection_matches,
+    process_belongs_to_us, process_has_buzz_marker, process_is_running, terminate_process,
+    terminate_untracked_pair_runtime, valid_agent_runtime_receipt,
 };
 
 mod orphan_sweep;
@@ -110,35 +113,6 @@ use lifecycle::kill_stale_tracked_processes_with;
 pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
-
-/// Classify an agent's persona against the live catalog for the Agents-menu
-/// drift indicator. Returns `(out_of_date, orphaned)`.
-///
-/// Drift basis is the RECORD's `persona_source_version`, never the engram:
-/// - persona_id set + persona present: out_of_date when the snapshot hash
-///   differs from the persona's current content hash.
-/// - persona_id set + persona gone: orphaned (no current hash to respawn into,
-///   so never out_of_date — we must not tell the user to respawn into nothing).
-/// - no persona_id: neither — a hand-built agent has no persona to drift from.
-fn persona_drift_state(
-    record: &ManagedAgentRecord,
-    personas: &[crate::managed_agents::types::AgentDefinition],
-) -> (bool, bool) {
-    let Some(persona_id) = record.persona_id.as_deref() else {
-        return (false, false);
-    };
-    let Some(persona) = personas.iter().find(|p| p.id == persona_id) else {
-        return (false, true);
-    };
-    let current = crate::managed_agents::persona_events::persona_content_hash(
-        &crate::managed_agents::persona_events::persona_event_content(persona),
-    );
-    let out_of_date = record
-        .persona_source_version
-        .as_deref()
-        .is_some_and(|pinned| pinned != current);
-    (out_of_date, false)
-}
 
 /// Resolve the runtime-pair key this record maps to for the active
 /// workspace: always the active workspace relay (the legacy per-record relay
@@ -276,12 +250,12 @@ pub fn build_managed_agent_summary(
 
     // The prospective side is computed only for a tracked pair: an unstamped
     // agent has nothing to compare against.
-    let tracked_spawn = pair_key.as_ref().zip(pair_runtime).map(|(_key, runtime)| {
+    let tracked_spawn = pair_key.as_ref().zip(pair_runtime).map(|(key, runtime)| {
         let current = crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
             record,
             personas,
             teams,
-            &runtime.spawn_config.relay_url,
+            &key.relay_url,
             global_config,
             super::owner_only_access_build(),
         );
@@ -469,37 +443,6 @@ pub(crate) fn spawn_with_effort_proof(
     cmd.spawn()
 }
 
-/// Relay values for one child spawn: a canonical process-identity URL and the
-/// caller-bound URL that must remain unchanged on the wire.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SpawnRelayTarget {
-    pub(crate) runtime_key: ManagedAgentRuntimeKey,
-    pub(crate) connection_url: String,
-}
-
-impl SpawnRelayTarget {
-    /// Stamp the actual connection URL onto the child command.
-    pub(crate) fn apply_to_command(&self, command: &mut std::process::Command) {
-        command.env("BUZZ_RELAY_URL", &self.connection_url);
-    }
-}
-
-/// Resolve the two relay representations required by a managed-agent spawn.
-///
-/// `ManagedAgentRuntimeKey` canonicalizes identity-equivalent loopback names so
-/// receipts and process maps cannot split. The configured URL remains the
-/// transport authority because its Host header selects the Buzz community.
-pub(crate) fn resolve_spawn_relay_target(
-    pubkey: &str,
-    configured_relay_url: &str,
-) -> Result<SpawnRelayTarget, String> {
-    let runtime_key = ManagedAgentRuntimeKey::new(pubkey.to_string(), configured_relay_url)?;
-    Ok(SpawnRelayTarget {
-        runtime_key,
-        connection_url: configured_relay_url.trim().to_string(),
-    })
-}
-
 /// Spawn an agent process without holding any locks on records or runtimes.
 /// Returns the child process and log path on success. The caller is responsible
 /// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
@@ -515,7 +458,7 @@ pub(crate) fn resolve_spawn_relay_target(
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
-    connection_relay_url: &str,
+    relay_url: &str,
     lazy: bool,
     owner_hex: Option<&str>,
     replay_floor_unix: Option<u64>,
@@ -523,8 +466,7 @@ pub fn spawn_agent_child(
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
     }
-    // Resolve and validate before any side effect (including the log marker).
-    let relay_target = resolve_spawn_relay_target(&record.pubkey, connection_relay_url)?;
+    let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
     // Resolve the effective harness (agent command) from the linked persona, so
     // persona harness edits propagate on the next spawn; an explicit per-agent
     // override wins. `agent_args` and `mcp_command` are pure derivations of the
@@ -571,7 +513,7 @@ pub fn spawn_agent_child(
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
 
-    let log_path = super::managed_agent_runtime_log_path(app, &relay_target.runtime_key)?;
+    let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
         &log_path,
         &format!(
@@ -609,10 +551,11 @@ pub fn spawn_agent_child(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| effective_command.clone());
 
-    // The caller supplies the bound workspace URL. Keep its host spelling for
-    // the actual connection; only process identity, receipts, status and dedup
-    // use ManagedAgentRuntimeKey's canonical URL.
-    let effective_relay_url = relay_target.connection_url.clone();
+    // The canonical relay is only the pair identity. Preserve the configured
+    // authority for the network connection because relay communities are
+    // host-derived (`localhost` and `127.0.0.1` can be distinct tenants).
+    let effective_relay_url = connection_relay_url(relay_url);
+
     // Augment PATH for DMG launches so child processes can find:
     //   - bundled CLI via ~/.local/bin symlink
     //   - nvm-managed node/npm (nvm initializes only in interactive shells)
@@ -642,7 +585,7 @@ pub fn spawn_agent_child(
     }
     command.env("RUST_LOG", child_rust_log_filter());
     command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
-    relay_target.apply_to_command(&mut command);
+    command.env("BUZZ_RELAY_URL", &effective_relay_url);
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_IDLE_POOL_SLEEP", idle_pool_sleep_env(lazy));
     // Publish-first mention sends hand the harness the send timestamp as a
@@ -859,7 +802,11 @@ pub fn spawn_agent_child(
         super::spawn_snapshot::SpawnConfigInputs {
             record,
             descriptor: &descriptor,
-            relay_url: &effective_relay_url,
+            // Snapshot the canonical key relay, not the connection URL: the
+            // restart-drift check recomputes the prospective snapshot with
+            // `key.relay_url`, and the two must agree even when the configured
+            // spelling differs from the canonical one.
+            relay_url: &runtime_key.relay_url,
             team_instructions: team_instructions.as_deref(),
             system_prompt: effective_prompt.as_deref(),
             model: effective_model.as_deref(),
@@ -909,6 +856,7 @@ pub fn spawn_agent_child(
     return Ok(super::process_lifecycle::finish_spawn(
         child,
         log_path,
+        effective_relay_url,
         spawn_config,
         spawned_setup_mode,
         spawned_adapter_availability,
@@ -919,6 +867,7 @@ pub fn spawn_agent_child(
     Ok(crate::managed_agents::ManagedAgentProcess {
         child,
         log_path,
+        connect_relay_url: effective_relay_url,
         spawn_config,
         setup_mode: spawned_setup_mode,
         adapter_availability: spawned_adapter_availability,
@@ -948,6 +897,7 @@ pub fn start_managed_agent_process(
             .map_err(|error| format!("failed to inspect running process: {error}"))?
             .is_none()
         {
+            ensure_pair_connection_matches(runtime, &relay_url)?;
             return Ok(());
         }
 
@@ -958,20 +908,18 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    let mut process = spawn_agent_child(
-        app,
-        record,
-        workspace_relay.as_str(),
-        false,
-        owner_hex,
-        replay_floor_unix,
-    )?;
+    let mut process =
+        spawn_agent_child(app, record, &relay_url, false, owner_hex, replay_floor_unix)?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),
         pid: process.child.id(),
         desktop_instance_id: current_instance_id(app),
         started_at: now.clone(),
+        // The URL the child actually dialed, not the local `relay_url`
+        // binding — same string by construction here, but reading it off the
+        // process keeps every receipt site identical to the spawn.
+        connect_relay_url: Some(process.connect_relay_url.clone()),
     };
     if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
         let _ = terminate_process(process.child.id());
@@ -992,6 +940,10 @@ pub fn start_managed_agent_process(
 
 #[cfg(test)]
 mod test_fixtures;
+#[cfg(test)]
+pub(crate) use test_fixtures::make_pair_runtime_with_connect_url;
 
+#[cfg(test)]
+mod connect_url_tests;
 #[cfg(test)]
 mod tests;

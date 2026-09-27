@@ -108,15 +108,33 @@ pub(crate) fn resolve_session_title(display_name: Option<&str>, name: &str) -> O
         .find(|value| !value.is_empty())
 }
 
-/// Build the `RUST_LOG` value forwarded to the agent child: keep an existing
-/// filter that already mentions `buzz_acp`, append `buzz_acp=info` to any other
-/// non-empty filter, and default to `buzz_acp=info` when unset.
-pub(crate) fn child_rust_log_filter() -> String {
-    match std::env::var("RUST_LOG") {
-        Ok(existing) if existing.contains("buzz_acp") => existing,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
-        _ => "buzz_acp=info".to_string(),
-    }
+/// Classify an agent's persona against the live catalog for the Agents-menu
+/// drift indicator. Returns `(out_of_date, orphaned)`.
+///
+/// Drift basis is the RECORD's `persona_source_version`, never the engram:
+/// - persona_id set + persona present: out_of_date when the snapshot hash
+///   differs from the persona's current content hash.
+/// - persona_id set + persona gone: orphaned (no current hash to respawn into,
+///   so never out_of_date — we must not tell the user to respawn into nothing).
+/// - no persona_id: neither — a hand-built agent has no persona to drift from.
+pub(super) fn persona_drift_state(
+    record: &crate::managed_agents::ManagedAgentRecord,
+    personas: &[crate::managed_agents::types::AgentDefinition],
+) -> (bool, bool) {
+    let Some(persona_id) = record.persona_id.as_deref() else {
+        return (false, false);
+    };
+    let Some(persona) = personas.iter().find(|p| p.id == persona_id) else {
+        return (false, true);
+    };
+    let current = crate::managed_agents::persona_events::persona_content_hash(
+        &crate::managed_agents::persona_events::persona_event_content(persona),
+    );
+    let out_of_date = record
+        .persona_source_version
+        .as_deref()
+        .is_some_and(|pinned| pinned != current);
+    (out_of_date, false)
 }
 
 #[cfg(test)]

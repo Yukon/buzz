@@ -2,6 +2,14 @@ use crate::managed_agents::known_acp_runtime;
 #[path = "cli_tests.rs"]
 mod cli_tests;
 
+#[test]
+fn agent_connection_preserves_loopback_authority() {
+    assert_eq!(
+        super::connection_relay_url(" ws://localhost:3200/ "),
+        "ws://localhost:3200/"
+    );
+}
+
 // ── desktop binary name tests ───────────────────────────────────────────
 
 #[test]
@@ -119,7 +127,9 @@ fn unknown_command_returns_none() {
 
 // ── build_respond_to_env tests ───────────────────────────────────────
 
-use super::test_fixtures::{expected_mode, expected_owner_only, fixture};
+use super::test_fixtures::{
+    expected_mode, expected_owner_only, fixture, minimal_record, receipt_fixture,
+};
 use super::{build_respond_to_env, build_respond_to_env_with_policy};
 use crate::managed_agents::types::{ManagedAgentRecord, RespondTo};
 
@@ -895,17 +905,6 @@ fn own_group_grandchild_detected_by_ancestor_walk() {
 
 // ── pair receipt validation tests ───────────────────────────────────────
 
-fn receipt_fixture(
-    key: crate::managed_agents::ManagedAgentRuntimeKey,
-) -> crate::managed_agents::ManagedAgentRuntimeReceipt {
-    crate::managed_agents::ManagedAgentRuntimeReceipt {
-        key,
-        pid: std::process::id(),
-        desktop_instance_id: "test-instance".into(),
-        started_at: "now".into(),
-    }
-}
-
 #[test]
 fn receipt_validation_rejects_noncanonical_identity() {
     let mut receipt = receipt_fixture(
@@ -1031,44 +1030,6 @@ fn workspace_pair_key_is_canonical() {
     let stamped = super::resolve_workspace_pair_key(&pubkey, "", "wss://one.example").unwrap();
     let viewed = super::resolve_workspace_pair_key(&pubkey, "", "WSS://One.Example:443/").unwrap();
     assert_eq!(stamped, viewed);
-}
-
-#[test]
-fn spawn_connection_preserves_the_bound_loopback_host() {
-    // Runtime identity deliberately folds loopback spellings together so one
-    // agent cannot spawn twice for localhost vs 127.0.0.1. The transport URL
-    // must remain the caller-bound workspace spelling because the relay Host
-    // header selects the community.
-    let pubkey = "aa".repeat(32);
-    let configured = "ws://localhost:3000";
-    let target = super::resolve_spawn_relay_target(&pubkey, configured).unwrap();
-    let mut command = std::process::Command::new("probe");
-    target.apply_to_command(&mut command);
-    let relay_env = command
-        .get_envs()
-        .find_map(|(key, value)| {
-            (key == "BUZZ_RELAY_URL").then(|| value.and_then(|value| value.to_str()))
-        })
-        .flatten();
-
-    assert_eq!(target.runtime_key.relay_url, "ws://127.0.0.1:3000");
-    assert_eq!(target.connection_url, "ws://localhost:3000");
-    assert_eq!(relay_env, Some("ws://localhost:3000"));
-}
-
-#[test]
-fn restart_targets_preserve_the_spawned_connection_host() {
-    let pubkey = "cc".repeat(32);
-    let key = super::ManagedAgentRuntimeKey::new(&pubkey, "ws://localhost:3000").unwrap();
-    assert_eq!(key.relay_url, "ws://127.0.0.1:3000");
-    let mut runtime = make_pair_runtime_placeholder();
-    runtime.spawn_config.relay_url = "ws://localhost:3000".to_string();
-    let runtimes = std::collections::HashMap::from([(key, runtime)]);
-
-    assert_eq!(
-        super::managed_agent_runtime_connection_urls(&runtimes, &pubkey),
-        vec!["ws://localhost:3000"]
-    );
 }
 
 #[test]
@@ -1257,66 +1218,12 @@ fn receipt_invalid_when_process_not_running() {
 
 // ── Test helpers (spawn-key regressions: see `runtime/spawn_key.rs`) ───────
 
-fn minimal_record(pubkey: &str) -> crate::managed_agents::ManagedAgentRecord {
-    serde_json::from_str(&format!(
-        r#"{{
-            "pubkey": "{pubkey}",
-            "name": "test",
-            "private_key_nsec": "nsec1fake",
-            "relay_url": "",
-            "acp_command": "buzz-acp",
-            "agent_command": "buzz-agent",
-            "agent_args": [],
-            "mcp_command": "",
-            "turn_timeout_seconds": 320,
-            "system_prompt": null,
-            "model": null,
-            "provider": null,
-            "env_vars": {{}},
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-            "last_started_at": null,
-            "last_stopped_at": null,
-            "last_exit_code": null,
-            "last_error": null
-        }}"#
-    ))
-    .expect("minimal_record fixture")
+fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRuntime {
+    make_pair_runtime_with_connect_url("wss://relay.example")
 }
 
-fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRuntime {
-    use std::process::{Command, Stdio};
-    // Spawn a real child so ManagedAgentProcess's Child field is satisfied;
-    // `true` exits immediately with 0. Absolute `/usr/bin/true` on unix (both
-    // macOS and Linux): parallel tests holding `lock_path_mutex` swap PATH to a
-    // tempdir, and a bare `true` lookup during that window fails NotFound
-    // (observed flake). Windows keeps the PATH lookup — no test there swaps it.
-    #[cfg(unix)]
-    let program = "/usr/bin/true";
-    #[cfg(windows)]
-    let program = "true";
-    let child = Command::new(program)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn true for placeholder");
-    let process = crate::managed_agents::ManagedAgentProcess {
-        child,
-        log_path: Default::default(),
-        spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
-            &minimal_record(&"cc".repeat(32)),
-            &[],
-            &[],
-            "wss://relay.example",
-            &Default::default(),
-            false,
-        ),
-        setup_mode: false,
-        adapter_availability: None,
-        start_nonce: "test-nonce".to_string(),
-        #[cfg(windows)]
-        job: None,
-    };
-    crate::managed_agents::ManagedAgentPairRuntime::starting(process)
+fn make_pair_runtime_with_connect_url(
+    connect_relay_url: &str,
+) -> crate::managed_agents::ManagedAgentPairRuntime {
+    super::test_fixtures::make_pair_runtime_with_connect_url(connect_relay_url)
 }
