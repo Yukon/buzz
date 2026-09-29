@@ -749,3 +749,7 @@ mod tests {
         assert!(observer_lifecycle_key(&ready_with_error.pubkey, &ready_with_error).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_commands_relay_tests.rs"]
+mod relay_tests;

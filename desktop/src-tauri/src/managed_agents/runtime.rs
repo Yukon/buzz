@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tauri::{AppHandle, Manager};
 
-pub(crate) use super::agent_env::child_rust_log_filter;
+use super::agent_env::child_rust_log_filter;
 use super::agent_env::idle_pool_sleep_env;
 
 use crate::{
@@ -455,8 +455,8 @@ pub(crate) fn spawn_with_effort_proof(
 /// publishes the triggering message before this spawn and passes its send
 /// timestamp here so the harness's first REQ replays past that message no
 /// matter how long the spawn takes. buzz-acp clamps stale floors to ~15 min.
-pub fn spawn_agent_child(
-    app: &AppHandle,
+pub fn spawn_agent_child<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     record: &ManagedAgentRecord,
     relay_url: &str,
     lazy: bool,
@@ -852,19 +852,7 @@ pub fn spawn_agent_child(
 
     // Windows: assign the harness to a Job Object so its whole tree dies with
     // the handle. The Unix process-group equivalent is set above.
-    #[cfg(windows)]
-    return Ok(super::process_lifecycle::finish_spawn(
-        child,
-        log_path,
-        effective_relay_url,
-        spawn_config,
-        spawned_setup_mode,
-        spawned_adapter_availability,
-        start_nonce,
-        &record.name,
-    ));
-    #[cfg(not(windows))]
-    Ok(crate::managed_agents::ManagedAgentProcess {
+    let process = crate::managed_agents::ManagedAgentProcess {
         child,
         log_path,
         connect_relay_url: effective_relay_url,
@@ -872,7 +860,12 @@ pub fn spawn_agent_child(
         setup_mode: spawned_setup_mode,
         adapter_availability: spawned_adapter_availability,
         start_nonce,
-    })
+        #[cfg(windows)]
+        job: None,
+    };
+    #[cfg(windows)]
+    let process = super::process_lifecycle::finish_spawn(process, &record.name);
+    Ok(process)
 }
 
 /// Spawn (or adopt) the runtime pair for `record` on the caller's bound
@@ -890,6 +883,8 @@ pub fn start_managed_agent_process(
     replay_floor_unix: Option<u64>,
 ) -> Result<(), String> {
     let key = bound_runtime_key(record, workspace_relay)?;
+    let relay_url =
+        crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay.as_str());
     if let Some(runtime) = runtimes.get_mut(&key) {
         if runtime
             .child
@@ -947,3 +942,11 @@ pub(crate) use test_fixtures::make_pair_runtime_with_connect_url;
 mod connect_url_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(super) mod relay_target_tests;
+
+#[cfg(all(test, unix))]
+pub(crate) use relay_target_tests::{
+    finish as finish_relay_target_process, fixture as relay_target_fixture,
+};

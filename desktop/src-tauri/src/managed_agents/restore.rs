@@ -418,15 +418,8 @@ pub async fn restore_managed_agents_on_launch(
                 record.last_stopped_at = None;
                 record.last_exit_code = None;
                 record.last_error = None;
-                runtimes.insert(
-                    key.clone(),
-                    super::ManagedAgentPairRuntime::starting(*process),
-                );
-                // Carry the spawn key's relay into profile reconciliation so
-                // the background task queries/publishes on the relay this
-                // spawn was actually keyed to — not whatever workspace is
-                // active when the task eventually executes.
-                successfully_spawned.push((pubkey, key.relay_url.clone()));
+                let connect_relay_url = track_restored_runtime(&mut runtimes, key, *process);
+                successfully_spawned.push((pubkey, connect_relay_url));
             }
             SpawnOutcome::Failed(error) => {
                 let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
@@ -459,9 +452,8 @@ pub async fn restore_managed_agents_on_launch(
                         private_key_nsec: record.private_key_nsec.clone(),
                         name: record.name.clone(),
                         relay_url: record.relay_url.clone(),
-                        // Pin the relay this spawn was keyed to (see the
-                        // successfully_spawned push above) so the deferred
-                        // task cannot resolve a post-switch workspace.
+                        // Pin the child's connection, retained by
+                        // track_restored_runtime, across workspace switches.
                         target_relay_url: Some(spawn_relay.clone()),
                         avatar_url: record.avatar_url.clone(),
                         auth_tag: record.auth_tag.clone(),
@@ -623,5 +615,40 @@ mod profile_reconcile_tests {
         assert!(!profile_reconcile_completed(
             ProfileReconcileOutcome::SkippedDisabled
         ));
+    }
+}
+
+/// Track the child and retain its connection target for deferred profile sync.
+/// The canonical key indexes the runtime; it must never become a dial target.
+fn track_restored_runtime(
+    runtimes: &mut std::collections::HashMap<
+        super::ManagedAgentRuntimeKey,
+        super::ManagedAgentPairRuntime,
+    >,
+    key: super::ManagedAgentRuntimeKey,
+    process: ManagedAgentProcess,
+) -> String {
+    let reconcile_target = process.connect_relay_url.clone();
+    runtimes.insert(key, super::ManagedAgentPairRuntime::starting(process));
+    reconcile_target
+}
+
+#[cfg(all(test, unix))]
+mod relay_target_tests {
+    #[test]
+    fn relay_target_restore_tracks_canonical_key_and_reconciles_connected_host() {
+        use crate::managed_agents::*;
+        let _guard = lock_path_mutex();
+        let (_dir, app, record) = relay_target_fixture();
+        let target = "ws://localhost:3000";
+        let mut process =
+            spawn_agent_child(app.handle(), &record, target, true, None, None).unwrap();
+        finish_relay_target_process(&mut process);
+        let key = ManagedAgentRuntimeKey::new(&record.pubkey, target).unwrap();
+        let mut runtimes = std::collections::HashMap::new();
+        let reconcile_url = super::track_restored_runtime(&mut runtimes, key.clone(), process);
+        assert_eq!(reconcile_url, target);
+        assert_eq!(runtimes[&key].connect_relay_url, target);
+        assert_eq!(runtimes[&key].spawn_config.relay_url, key.relay_url);
     }
 }

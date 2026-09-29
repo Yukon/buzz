@@ -22,6 +22,9 @@ mod inbound_tests;
 #[cfg(all(test, not(target_os = "windows")))]
 mod catalog_reconcile_tests;
 
+#[cfg(all(test, unix))]
+mod relay_target_tests;
+
 #[derive(Debug)]
 enum InboundRuntimeRefresh {
     Local {
@@ -349,10 +352,7 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                             .lock()
                             .map_err(|error| error.to_string())?;
                         let mut relay_urls =
-                            crate::managed_agents::managed_agent_runtime_keys(&runtimes, &d_tag)
-                                .into_iter()
-                                .map(|key| key.relay_url)
-                                .collect::<Vec<_>>();
+                            crate::managed_agents::managed_agent_restart_targets(&runtimes, &d_tag);
                         if relay_urls.is_empty() && record.runtime_pid.is_some() {
                             relay_urls.push(crate::relay::effective_agent_relay_url(
                                 &record.relay_url,

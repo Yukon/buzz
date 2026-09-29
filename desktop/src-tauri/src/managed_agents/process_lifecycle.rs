@@ -175,35 +175,20 @@ pub fn taskkill_tree(pid: u32) -> Result<(), String> {
     }
 }
 
-/// Assign a freshly-spawned harness `child` to a Job Object and package it into
-/// a [`ManagedAgentProcess`]. On job-assignment failure the process is still
+/// Assign the freshly spawned process's child to a Job Object.
+/// On job-assignment failure the process is still
 /// returned with `job: None` — teardown then falls back to `Child::kill()`,
 /// which kills only the harness (a degraded teardown beats a failed spawn).
 pub fn finish_spawn(
-    child: std::process::Child,
-    log_path: std::path::PathBuf,
-    connect_relay_url: String,
-    spawn_config: super::spawn_snapshot::SpawnConfigSnapshot,
-    setup_mode: bool,
-    adapter_availability: Option<super::AcpAvailabilityStatus>,
-    start_nonce: String,
+    mut process: super::ManagedAgentProcess,
     agent_name: &str,
 ) -> super::ManagedAgentProcess {
-    let job = create_job_for_child(child.id());
-    if job.is_none() {
+    process.job = create_job_for_child(process.child.id());
+    if process.job.is_none() {
         eprintln!(
             "buzz-desktop: failed to assign agent {agent_name} to a Job Object; \
              teardown will fall back to killing only the harness process"
         );
     }
-    super::ManagedAgentProcess {
-        child,
-        log_path,
-        connect_relay_url,
-        spawn_config,
-        setup_mode,
-        adapter_availability,
-        start_nonce,
-        job,
-    }
+    process
 }
